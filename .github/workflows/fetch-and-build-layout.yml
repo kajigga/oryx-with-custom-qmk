@@ -1,0 +1,243 @@
+name: Fetch and build layout
+
+on:
+  push:
+    branches: 
+      - main
+  workflow_dispatch:
+    inputs:
+      layout_id:
+        description: "Layout id available in URL https://configure.zsa.io/voyager/layouts/[ID_IS_HERE]/latest"
+        required: false
+        default: "NKrmd"
+      layout_geometry:
+        description: "Keyboard type"
+        type: choice
+        options:
+          - voyager
+          - moonlander/reva
+          - moonlander/revb
+          - ergodox_ez
+          - ergodox_ez/m32u4/glow
+          - ergodox_ez/m32u4/shine
+          - ergodox_ez/stm32
+          - ergodox_ez/stm32/glow
+          - ergodox_ez/stm32/shine
+          - planck_ez
+          - planck_ez/glow
+        default: voyager
+
+permissions:
+  contents: write
+env:
+  LAYOUT_ID: "NKrmd"
+  LAYOUT_GEOMETRY: "voyager"
+
+jobs:
+  fetch-and-build-layout:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Download layout source
+        id: download-layout-source
+        run: |
+          response=$(curl --location 'https://oryx.zsa.io/graphql' --header 'Content-Type: application/json' --data '{"query":"query getLayout($hashId: String!, $revisionId: String!, $geometry: String) {layout(hashId: $hashId, geometry: $geometry, revisionId: $revisionId) {  revision { hashId, qmkVersion, title }}}","variables":{"hashId":"${{ env.LAYOUT_ID }}","geometry":"${{ env.LAYOUT_GEOMETRY }}","revisionId":"latest"}}' | jq '.data.layout.revision | [.hashId, .qmkVersion, .title]')
+          hash_id=$(echo "${response}" | jq -r '.[0]')
+          firmware_version=$(printf "%.0f" $(echo "${response}" | jq -r '.[1]'))
+          change_description=$(echo "${response}" | jq -r '.[2]')
+          if [[ -z "${change_description}" ]]; then
+            change_description="latest layout modification made with Oryx"
+          fi
+          
+          curl -L "https://oryx.zsa.io/source/${hash_id}" -o source.zip
+          
+          echo firmware_version=${firmware_version} >> "$GITHUB_OUTPUT"
+          echo change_description=${change_description} >> "$GITHUB_OUTPUT"
+
+      - name: Backup custom additions
+        run: |
+          if [ -f ${{ env.LAYOUT_ID }}/custom_additions.c ]; then
+            cp ${{ env.LAYOUT_ID }}/custom_additions.c /tmp/custom_additions.c
+            echo "has_custom_additions=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_custom_additions=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Backup Dockerfile
+        run: |
+          if [ -f Dockerfile ]; then
+            cp Dockerfile /tmp/Dockerfile
+            echo "has_dockerfile=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_dockerfile=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Backup workflow
+        run: |
+          if [ -f .github/workflows/fetch-and-build-layout.yml ]; then
+            cp .github/workflows/fetch-and-build-layout.yml /tmp/workflow.yml
+            echo "has_workflow=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_workflow=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Unzip the source file
+        run: |
+          unzip -oj source.zip '*_source/*' -d ${{ env.LAYOUT_ID }}
+          rm source.zip
+
+      - name: Restore custom additions
+        if: steps.backup-custom-additions.outputs.has_custom_additions == 'true'
+        run: |
+          cp /tmp/custom_additions.c ${{ env.LAYOUT_ID }}/custom_additions.c
+
+      - name: Restore Dockerfile
+        if: steps.backup-dockerfile.outputs.has_dockerfile == 'true'
+        run: |
+          cp /tmp/Dockerfile Dockerfile
+
+      - name: Restore workflow
+        if: steps.backup-workflow.outputs.has_workflow == 'true'
+        run: |
+          cp /tmp/workflow.yml .github/workflows/fetch-and-build-layout.yml
+
+      - name: Validate keymap.c key counts (total per layer = 52)
+        run: |
+          python3 << 'PYEOF'
+          import re
+          import sys
+          
+          EXPECTED_TOTAL_KEYS = 52  # Voyager has 52 keys
+          
+          def count_top_level_commas(text):
+              """Count commas not inside parentheses"""
+              depth = 0
+              count = 0
+              for char in text:
+                  if char == '(':
+                      depth += 1
+                  elif char == ')':
+                      depth -= 1
+                  elif char == ',' and depth == 0:
+                      count += 1
+              return count
+          
+          with open('${{ env.LAYOUT_ID }}/keymap.c', 'r') as f:
+              content = f.read()
+          
+          layer_pattern = r'\[(\d+)\]\s*=\s*LAYOUT_voyager\('
+          matches = list(re.finditer(layer_pattern, content))
+          
+          validation_errors = []
+          
+          for idx, match in enumerate(matches):
+              layer_num = match.group(1)
+              start = match.end()
+              
+              if idx + 1 < len(matches):
+                  end = matches[idx + 1].start()
+              else:
+                  end_match = re.search(r'\}\s*;\s*$', content[start:], re.MULTILINE)
+                  if end_match:
+                      end = start + end_match.start()
+                  else:
+                      end = len(content)
+              
+              layer_content = content[start:end]
+              key_count = count_top_level_commas(layer_content) + 1
+              
+              status = "OK" if key_count == EXPECTED_TOTAL_KEYS else f"ERROR"
+              print(f"Layer {layer_num}: {key_count} keys (expected {EXPECTED_TOTAL_KEYS}) - {status}")
+              
+              if key_count != EXPECTED_TOTAL_KEYS:
+                  validation_errors.append(f"Layer {layer_num}: has {key_count} keys, expected {EXPECTED_TOTAL_KEYS}")
+          
+          print("")
+          if validation_errors:
+              for err in validation_errors:
+                  print(f"  {err}")
+              print("\nBUILD WILL FAIL: Fix key counts in Oryx")
+              sys.exit(1)
+          else:
+              print("All layers have correct key count (52)")
+          PYEOF
+
+      - name: Merge rules.mk with required flags
+        run: |
+          if ! grep -q "LEADER_ENABLE = yes" ${{ env.LAYOUT_ID }}/rules.mk; then
+            echo "LEADER_ENABLE = yes" >> ${{ env.LAYOUT_ID }}/rules.mk
+          fi
+
+      - name: Check for QK_LEAD in keymap
+        id: check-qk-lead
+        run: |
+          if grep -q "QK_LEAD" ${{ env.LAYOUT_ID }}/keymap.c; then
+            echo "has_qk_lead=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_qk_lead=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Add QK_LEAD if missing (before KC_MAC_UNDO in layer 4)
+        if: steps.check-qk-lead.outputs.has_qk_lead == 'false'
+        run: |
+          sed -i 's/KC_TRANSPARENT, KC_MAC_UNDO,/QK_LEAD, KC_MAC_UNDO,/' ${{ env.LAYOUT_ID }}/keymap.c
+
+      - name: Append custom additions to keymap.c
+        run: |
+          if [ -f ${{ env.LAYOUT_ID }}/custom_additions.c ]; then
+            cat ${{ env.LAYOUT_ID }}/custom_additions.c >> ${{ env.LAYOUT_ID }}/keymap.c
+          fi
+
+      - name: Commit and Push changes
+        env:
+          CHANGE_DESCRIPTION: ${{ steps.download-layout-source.outputs.change_description }}
+        run: |
+          git config --local user.name "github-actions"
+          git config --local user.email "github-actions@github.com"
+          git add .
+          printf "✨(oryx): %s\n" "$CHANGE_DESCRIPTION" | git commit -F - || echo "No layout change"
+          git pull --rebase || true
+          git push
+
+      - name: Update QMK firmware to latest version (${{ steps.download-layout-source.outputs.firmware_version }})
+        run: |
+          rm -rf qmk_firmware
+          git clone --depth=1 https://github.com/zsa/qmk_firmware.git qmk_firmware
+          cd qmk_firmware
+          git fetch origin firmware${{ steps.download-layout-source.outputs.firmware_version }} --depth=1
+          git checkout -B firmware${{ steps.download-layout-source.outputs.firmware_version }} origin/firmware${{ steps.download-layout-source.outputs.firmware_version }}
+          git submodule update --init --recursive
+
+      - name: Build the layout
+        id: build-layout
+        run: |
+          if [ "${{ steps.download-layout-source.outputs.firmware_version }}" -ge 24 ]; then
+            keyboard_directory="qmk_firmware/keyboards/zsa"
+            make_prefix="zsa/"
+          else
+            keyboard_directory="qmk_firmware/keyboards"
+            make_prefix=""
+          fi
+          
+          rm -rf ${keyboard_directory}/${{ env.LAYOUT_GEOMETRY }}/keymaps/${{ env.LAYOUT_ID }}
+          mkdir -p ${keyboard_directory}/${{ env.LAYOUT_GEOMETRY }}/keymaps && cp -r ${{ env.LAYOUT_ID }} "$_"
+          
+          docker run -v ./qmk_firmware:/root --rm qmk /bin/sh -c "
+            make ${make_prefix}${{ env.LAYOUT_GEOMETRY }}:${{ env.LAYOUT_ID }}
+          "
+          
+          normalized_layout_geometry="$(echo "${{ env.LAYOUT_GEOMETRY }}" | sed 's/\//_/g')"
+          echo built_layout_file=$(find ./qmk_firmware -maxdepth 1 -type f -regex ".*${normalized_layout_geometry}.*\.\(bin\|hex\)$") >> "$GITHUB_OUTPUT"
+          echo normalized_layout_geometry=${normalized_layout_geometry} >> "$GITHUB_OUTPUT"
+
+      - name: Upload layout
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.build-layout.outputs.normalized_layout_geometry }}_${{ env.LAYOUT_ID }}
+          path: ${{ steps.build-layout.outputs.built_layout_file }}
