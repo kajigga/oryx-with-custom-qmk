@@ -1,7 +1,18 @@
 # QMK Firmware Build Environment
-# Based on qmk/qmk_base_container for stable toolchain.
+# Provides the toolchain for compiling QMK firmware for ZSA keyboards.
+# The QMK source is mounted into the container at build time.
 
-FROM qmk/qmk_base_container:latest
+FROM debian:stable-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    python3 \
+    python3-pip \
+    build-essential \
+    gcc-arm-none-eabi \
+    libnewlib-arm-none-eabi \
+    binutils-arm-none-eabi \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m pip install --break-system-packages qmk appdirs
 
