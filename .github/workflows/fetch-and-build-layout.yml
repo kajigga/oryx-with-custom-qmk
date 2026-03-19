@@ -214,6 +214,9 @@ jobs:
           git checkout -B firmware${{ steps.download-layout-source.outputs.firmware_version }} origin/firmware${{ steps.download-layout-source.outputs.firmware_version }}
           git submodule update --init --recursive
 
+      - name: Build qmk docker image
+        run: docker build -t qmk .
+
       - name: Build the layout
         id: build-layout
         run: |
